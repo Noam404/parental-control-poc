@@ -46,94 +46,126 @@ HEADER = "{:>4}  {:<7}  {:<40}  {:>11}  {:<12}".format(
 ROW = "{:>4}  {:<7}  {:<40}  {:>11}  {:<12}"
 
 
-def http_host(packet) -> str:
-    """Domain of an HTTP request, from the Host header."""
-    http = packet[HTTPRequest]
-    if http.Host:
-        host = http.Host.decode(errors="replace")
+def get_domain_from_http_host_header(packet) -> str:
+    """
+    Return the domain of a plaintext HTTP request.
+
+    HTTP/1.1 puts the target site in the "Host" header, so we read it straight
+    from there. If that header is somehow missing we fall back to the raw
+    destination IP so the row is never blank.
+    """
+    http_layer = packet[HTTPRequest]
+    if http_layer.Host:
+        host = http_layer.Host.decode(errors="replace")
     elif packet.haslayer(IP):
-        host = packet[IP].dst  # fall back to the destination IP
+        host = packet[IP].dst  # no Host header -> show where the packet is going
     else:
         host = "?"
-    # Strip a trailing port such as "example.com:8080".
+    # A Host header may carry a port ("example.com:8080"); keep only the name.
     return host.split(":")[0]
 
 
-def tls_sni(payload: bytes) -> str | None:
+def get_domain_from_tls_client_hello(tcp_payload: bytes) -> str | None:
     """
-    Extract the SNI hostname from a TLS ClientHello.
+    Return the domain from a TLS ClientHello, or None if there isn't one.
 
-    Parses the raw record by hand (no TLS layer needed). Returns the domain,
-    or None if the payload is not a ClientHello or carries no SNI extension.
-    Every access is bounds-checked so malformed packets just yield None.
+    When a browser opens an HTTPS connection, the very first message it sends
+    (the "ClientHello") announces which site it wants in the unencrypted
+    Server Name Indication (SNI) extension. The rest of the connection is
+    encrypted, but this one field is readable, so we walk the ClientHello
+    byte-by-byte and pull the hostname out of it.
+
+    We parse the raw bytes by hand instead of using Scapy's TLS layer because
+    it is simpler and has no extra dependencies. Every field length is checked
+    against the buffer, so a truncated or non-TLS packet just returns None
+    rather than raising.
     """
     try:
-        # TLS record header: type(1) version(2) length(2).
-        if len(payload) < 5 or payload[0] != 0x16:  # 0x16 = handshake
+        # -- TLS record header: content_type(1) + version(2) + length(2) --
+        # 0x16 marks a "handshake" record; anything else is not a ClientHello.
+        if len(tcp_payload) < 5 or tcp_payload[0] != 0x16:
             return None
         pos = 5
 
-        # Handshake header: type(1) length(3).
-        if payload[pos] != 0x01:  # 0x01 = ClientHello
+        # -- Handshake header: msg_type(1) + length(3) --
+        # 0x01 is specifically the ClientHello message.
+        if tcp_payload[pos] != 0x01:
             return None
         pos += 4
 
-        pos += 2 + 32  # client_version(2) + random(32)
+        pos += 2 + 32  # skip client_version(2) and the 32-byte random
 
-        # session_id: len(1) + bytes.
-        pos += 1 + payload[pos]
+        # session_id: one length byte, then that many bytes.
+        pos += 1 + tcp_payload[pos]
 
-        # cipher_suites: len(2) + bytes.
-        cipher_len = int.from_bytes(payload[pos:pos + 2], "big")
-        pos += 2 + cipher_len
+        # cipher_suites: two-byte length, then that many bytes.
+        cipher_suites_len = int.from_bytes(tcp_payload[pos:pos + 2], "big")
+        pos += 2 + cipher_suites_len
 
-        # compression_methods: len(1) + bytes.
-        pos += 1 + payload[pos]
+        # compression_methods: one length byte, then that many bytes.
+        pos += 1 + tcp_payload[pos]
 
-        # extensions: len(2) + bytes.
-        if pos + 2 > len(payload):
+        # -- extensions: two-byte total length, then the extension list --
+        if pos + 2 > len(tcp_payload):
             return None
-        ext_end = pos + 2 + int.from_bytes(payload[pos:pos + 2], "big")
+        extensions_end = pos + 2 + int.from_bytes(tcp_payload[pos:pos + 2], "big")
         pos += 2
 
-        while pos + 4 <= ext_end:
-            ext_type = int.from_bytes(payload[pos:pos + 2], "big")
-            ext_len = int.from_bytes(payload[pos + 2:pos + 4], "big")
-            body = pos + 4
-            if ext_type == 0x0000:  # server_name
-                # server_name_list: len(2), then entry:
-                #   name_type(1) + name_len(2) + name.
-                name_len = int.from_bytes(payload[body + 3:body + 5], "big")
-                start = body + 5
-                name = payload[start:start + name_len]
-                return name.decode(errors="replace") or None
-            pos = body + ext_len
+        # Walk each extension looking for SNI (type 0x0000).
+        while pos + 4 <= extensions_end:
+            ext_type = int.from_bytes(tcp_payload[pos:pos + 2], "big")
+            ext_len = int.from_bytes(tcp_payload[pos + 2:pos + 4], "big")
+            ext_body = pos + 4
+            if ext_type == 0x0000:  # server_name extension
+                # Inside: server_name_list_len(2), then one entry made of
+                # name_type(1) + host_name_len(2) + host_name bytes.
+                host_name_len = int.from_bytes(
+                    tcp_payload[ext_body + 3:ext_body + 5], "big"
+                )
+                host_name_start = ext_body + 5
+                host_name = tcp_payload[
+                    host_name_start:host_name_start + host_name_len
+                ]
+                return host_name.decode(errors="replace") or None
+            pos = ext_body + ext_len  # skip to the next extension
     except (IndexError, ValueError):
+        # Malformed / unexpected layout -> treat as "no domain found".
         return None
     return None
 
 
-def make_handler():
-    """Return a packet callback that keeps its own ascending counter."""
-    counter = {"n": 0}
+def build_packet_handler():
+    """
+    Build the per-packet callback that Scapy calls for every sniffed packet.
 
-    def emit(proto: str, domain: str, size: int) -> None:
-        counter["n"] += 1
+    The returned function keeps its own ascending request counter in a closure
+    so each printed row is numbered 1, 2, 3, ... across the whole session.
+    """
+    request_counter = {"n": 0}
+
+    def print_request_row(protocol: str, domain: str, packet_size: int) -> None:
+        """Number and print one request as a table row."""
+        request_counter["n"] += 1
         seen_at = datetime.now().strftime("%H:%M:%S")
         print(
-            ROW.format(counter["n"], proto, domain[:40], size, seen_at),
+            ROW.format(
+                request_counter["n"], protocol, domain[:40], packet_size, seen_at
+            ),
             flush=True,
         )
 
-    def handle(packet):
+    def on_packet(packet) -> None:
+        """Classify a packet as HTTP or HTTPS and print it if it's a request."""
         if packet.haslayer(HTTPRequest):
-            emit("HTTP", http_host(packet), len(packet))
+            print_request_row("HTTP", get_domain_from_http_host_header(packet),
+                              len(packet))
         elif packet.haslayer(Raw):
-            domain = tls_sni(bytes(packet[Raw].load))
+            # Only ClientHello packets yield a domain; everything else -> None.
+            domain = get_domain_from_tls_client_hello(bytes(packet[Raw].load))
             if domain:
-                emit("HTTPS", domain, len(packet))
+                print_request_row("HTTPS", domain, len(packet))
 
-    return handle
+    return on_packet
 
 
 def main() -> None:
@@ -161,7 +193,7 @@ def main() -> None:
         sniff(
             iface=args.iface,
             filter=args.filter,
-            prn=make_handler(),
+            prn=build_packet_handler(),
             store=False,
             count=args.count,
         )
