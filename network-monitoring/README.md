@@ -51,5 +51,44 @@ Example output:
 - For HTTPS only the **domain** (SNI) is visible — never the path or content.
   A modern extension called Encrypted Client Hello (ECH) can hide even the
   SNI; those requests simply won't be resolved by this PoC.
-- This component only prints. Sending rows to the server over a socket and the
-  firewall/blocking logic are separate tasks in the project roadmap.
+- The sniffer only prints. Sending rows to the server over a socket is a
+  separate task in the project roadmap.
+
+---
+
+# Domain Blocking — `hosts_blocker.py` (Linux)
+
+Blocks websites by pointing their domains at `0.0.0.0` in the Linux hosts
+file (`/etc/hosts`), so the OS resolves them to a dead address and the
+connection never leaves the machine. No firewall rules needed.
+
+All entries live between two markers, and the whole block is rewritten on
+every run — so nothing outside the markers is touched and no stale entries
+pile up:
+
+```text
+# >>> PARENTAL-CONTROL BLOCK START >>>
+# Managed automatically by hosts_blocker.py - do not edit by hand.
+# Last updated: 2026-08-30 18:35:40
+0.0.0.0	example.com
+0.0.0.0	www.example.com
+# <<< PARENTAL-CONTROL BLOCK END <<<
+```
+
+Each blocked domain is expanded to both its bare and `www.` form.
+
+## Run
+
+Editing `/etc/hosts` needs root.
+
+```bash
+sudo python3 hosts_blocker.py block example.com facebook.com   # block sites
+sudo python3 hosts_blocker.py list                             # show blocked
+sudo python3 hosts_blocker.py unblock                          # remove block
+```
+
+Try it safely against a scratch file, no root required:
+
+```bash
+python3 hosts_blocker.py --hosts-file ./hosts.test block example.com
+```
