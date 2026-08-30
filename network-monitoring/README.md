@@ -62,22 +62,32 @@ Blocks websites by pointing their domains at `0.0.0.0` in the Linux hosts
 file (`/etc/hosts`), so the OS resolves them to a dead address and the
 connection never leaves the machine. No firewall rules needed.
 
-Edit the `BLOCKED_DOMAINS` list at the top of the script to choose what gets
-blocked, then run it. All entries sit between two markers, and the whole block
-is rewritten on every run — so nothing outside the markers is touched and no
-stale entries pile up:
+All entries live between two markers, and the whole block is rewritten on
+every run — so nothing outside the markers is touched and no stale entries
+pile up:
 
 ```text
 # >>> PARENTAL-CONTROL BLOCK START >>>
+# Managed automatically by hosts_blocker.py - do not edit by hand.
 0.0.0.0	example.com
 0.0.0.0	www.example.com
 # <<< PARENTAL-CONTROL BLOCK END <<<
 ```
+
+Each blocked domain is expanded to both its bare and `www.` form.
 
 ## Run
 
 Editing `/etc/hosts` needs root.
 
 ```bash
-sudo python3 hosts_blocker.py
+sudo python3 hosts_blocker.py block example.com facebook.com   # block sites
+sudo python3 hosts_blocker.py list                             # show blocked
+sudo python3 hosts_blocker.py unblock                          # remove block
+```
+
+Try it safely against a scratch file, no root required:
+
+```bash
+python3 hosts_blocker.py --hosts-file ./hosts.test block example.com
 ```
